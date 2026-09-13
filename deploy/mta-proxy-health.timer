@@ -1,0 +1,10 @@
+[Unit]
+Description=Check MTA every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

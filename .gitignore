@@ -1,0 +1,11 @@
+__pycache__/
+*.log
+.venv/
+cloudflared
+*.deb
+root/
+libs/
+.env
+.env.*
+*.pem
+*.key

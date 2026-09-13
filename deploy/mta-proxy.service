@@ -1,0 +1,16 @@
+[Unit]
+Description=MTA subway board proxy
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/mta-proxy/current
+ExecStart=%h/mta-proxy/current/.venv/bin/python -u server.py
+Environment=MTA_PROXY_BIND=127.0.0.1
+Environment=MTA_PROXY_PORT=8087
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

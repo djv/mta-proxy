@@ -1,0 +1,9 @@
+[Unit]
+Description=Check MTA process and upstream station response
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/mta-proxy/current
+ExecStart=%h/mta-proxy/current/.venv/bin/python healthcheck.py
+# Upstream outages are logged separately and must not restart a healthy process.
+SuccessExitStatus=2
