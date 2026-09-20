@@ -31,7 +31,7 @@ rollback() {
 trap rollback ERR
 python3 -m venv "$release/.venv"
 "$release/.venv/bin/pip" install --disable-pip-version-check -r "$release/requirements.lock"
-(cd "$release" && .venv/bin/python -m unittest -v test_board test_hosting test_audit test_entrances)
+(cd "$release" && .venv/bin/python -m unittest -v test_board test_hosting test_audit test_entrances test_alerts)
 if [ -n "$previous" ] && [ -d "$previous" ]; then ln -sfn "$previous" "$root/previous"; fi
 ln -sfn "$release" "$root/current"
 cp "$release"/deploy/*.service "$release"/deploy/*.timer "$HOME/.config/systemd/user/"

@@ -13,6 +13,12 @@ from unittest.mock import patch
 import server
 
 
+def setUpModule():
+    patcher = patch.object(server, "get_alerts", return_value=([], False))
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 def _station(sid, name="Union", lat=40.735, lon=-73.991, routes=("L",)):
     return dict(id=sid, name=name, lat=lat, lon=lon, routes=list(routes))
 
@@ -143,8 +149,6 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(server._epoch(naive), ts)
 
 
-
-
 class CacheTests(unittest.TestCase):
     def _write(self, path, obj, mtime):
         path.write_text(json.dumps(obj))
@@ -158,27 +162,21 @@ class CacheTests(unittest.TestCase):
                 self._write(cache, [{"id": "X"}], 2000)
                 zipf.write_bytes(b"zip")
                 os.utime(zipf, (1000, 1000))
-                stations, source = server.load_station_cache(
-                    str(cache), str(zipf)
-                )
+                stations, source = server.load_station_cache(str(cache), str(zipf))
         loader.assert_not_called()
         self.assertEqual(source, "cache")
         self.assertEqual(stations, [{"id": "X"}])
 
     def test_stale_cache_rebuilds_from_zip(self):
         sentinel = [{"id": " rebuilt"}]
-        with patch.object(
-            server, "load_stations", return_value=sentinel
-        ) as loader:
+        with patch.object(server, "load_stations", return_value=sentinel) as loader:
             with tempfile.TemporaryDirectory() as tmp:
                 cache = pathlib.Path(tmp) / "stations.json"
                 zipf = pathlib.Path(tmp) / "static.zip"
                 self._write(cache, [{"id": "old"}], 1000)
                 zipf.write_bytes(b"zip")
                 os.utime(zipf, (2000, 2000))
-                stations, source = server.load_station_cache(
-                    str(cache), str(zipf)
-                )
+                stations, source = server.load_station_cache(str(cache), str(zipf))
                 self.assertEqual(cache.read_text(), '[{"id": " rebuilt"}]')
         loader.assert_called_once_with(str(zipf))
         self.assertEqual(source, "zip")
@@ -197,7 +195,6 @@ class CacheTests(unittest.TestCase):
     def test_mtime_str(self):
         self.assertEqual(server._mtime_str("/nonexistent/path/xyz"), "missing")
         self.assertRegex(server._mtime_str(__file__), r"^20\d\d-")
-
 
 
 class SingleflightTests(unittest.TestCase):
@@ -267,9 +264,7 @@ class SingleflightTests(unittest.TestCase):
         calls, release = [], threading.Event()
         feed_inst, fake_get = self._mock_fetch(now, calls, release)
         with self._patched(now, feed_inst, fake_get):
-            threads, results, errors = self._spawn(
-                8, lambda: server.get_feed("gtfs-l")
-            )
+            threads, results, errors = self._spawn(8, lambda: server.get_feed("gtfs-l"))
             self._wait_for_calls(calls)
             time.sleep(0.3)  # let waiters pile onto the in-flight fetch
             release.set()
@@ -286,9 +281,7 @@ class SingleflightTests(unittest.TestCase):
             now, calls, release, fail=RuntimeError("down")
         )
         with self._patched(now, feed_inst, fake_get):
-            threads, results, errors = self._spawn(
-                4, lambda: server.get_feed("gtfs-l")
-            )
+            threads, results, errors = self._spawn(4, lambda: server.get_feed("gtfs-l"))
             self._wait_for_calls(calls)
             time.sleep(0.3)
             release.set()
@@ -326,7 +319,6 @@ class SingleflightTests(unittest.TestCase):
                 server.get_feed("gtfs-l")
         self.assertEqual(len(calls), 1)
         self.assertEqual(server.feeds, {})
-
 
 
 if __name__ == "__main__":

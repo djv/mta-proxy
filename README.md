@@ -23,6 +23,11 @@ Bundled `stations.json` avoids static-feed parsing at startup. If the optional
 - Optional `station=<GTFS parent ID>&route=L&dir=N` selects a station and travel
   direction. Direction is `N` or `S`; filtering happens before the arrival limit.
   Each station also includes `options` with route/direction/destination labels.
+- Active MTA service alerts are attached per station as
+  `station.alerts = [{title, desc, routes}]` when they match the station's lines
+  (or one of its stop IDs). The board also returns `alerts_available`; an alerts
+  fetch failure leaves the board working with `alerts_available: false`.
+  Alerts come from the public `camsys/subway-alerts` GTFS-RT feed, cached 60s.
 
 Limits: stations 1–5, arrivals 1–8. Feed cache 25s per line group.
 

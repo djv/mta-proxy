@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from nyct_gtfs import NYCTFeed
 from entrances import load_entrances, combine
+from alerts import ALERTS_URL, for_station, parse_alerts
 
 
 LOG = logging.getLogger("mta-proxy")
@@ -34,12 +35,15 @@ PORT = int(os.environ.get("MTA_PROXY_PORT", "8087"))
 STATIC_ZIP = "google_transit.zip"
 FEED_TTL_S = 25
 FEED_MAX_AGE_S = 180
+ALERTS_TTL_S = 60
 
 stations = []  # [{id,name,lat,lon,routes[]}]
 entrances = {}
 feeds = {}  # feed_key -> (fetched_at, NYCTFeed)
 feeds_lock = threading.Lock()
 feeds_inflight = {}  # feed_key -> _Inflight
+alerts_cache = (0.0, [], False)  # (fetched_at, alerts, available)
+alerts_lock = threading.Lock()
 
 
 class _Inflight:
@@ -49,6 +53,7 @@ class _Inflight:
         self.event = threading.Event()
         self.result = None
         self.error: BaseException | None = None
+
 
 FEED_FOR_ROUTE = {}
 for _r in ["1", "2", "3", "4", "5", "6", "7", "S"]:
@@ -191,19 +196,60 @@ def get_feed(feed_key):
     return feed, False
 
 
-def board(lat, lon, limit_stations=1, limit_arrivals=4, station_id=None, route=None, dest=None, direction=None):
-    if direction not in (None, 'N', 'S'):
-        raise ValueError('Invalid direction')
+def _fetch_alerts():
+    response = requests.get(ALERTS_URL, timeout=(2, 4))
+    response.raise_for_status()
+    return parse_alerts(response.content)
+
+
+def get_alerts():
+    """Return (alerts, available); failures degrade to empty, never raise."""
+    global alerts_cache
+    now = time.time()
+    with alerts_lock:
+        fetched_at, data, available = alerts_cache
+        if fetched_at and now - fetched_at < ALERTS_TTL_S:
+            return data, available
+    try:
+        data, available = _fetch_alerts(), True
+    except Exception as exc:
+        LOG.error("alerts_failure type=%s", type(exc).__name__)
+        data, available = [], False
+    with alerts_lock:
+        alerts_cache = (now, data, available)
+    return data, available
+
+
+def board(
+    lat,
+    lon,
+    limit_stations=1,
+    limit_arrivals=4,
+    station_id=None,
+    route=None,
+    dest=None,
+    direction=None,
+):
+    if direction not in (None, "N", "S"):
+        raise ValueError("Invalid direction")
     anchor = None
     if station_id:
-        anchor = next((s for s in stations if s['id'] == station_id), None)
+        anchor = next((s for s in stations if s["id"] == station_id), None)
         if anchor is None:
-            raise ValueError('Unknown station')
-        selected = [s for s in stations if s['id'] == station_id or
-                    (s['name'] == anchor['name'] and
-                     haversine_m(s['lat'], s['lon'], anchor['lat'], anchor['lon']) < 300)]
+            raise ValueError("Unknown station")
+        selected = [
+            s
+            for s in stations
+            if s["id"] == station_id
+            or (
+                s["name"] == anchor["name"]
+                and haversine_m(s["lat"], s["lon"], anchor["lat"], anchor["lon"]) < 300
+            )
+        ]
     else:
-        ranked = sorted(stations, key=lambda s: haversine_m(lat, lon, s["lat"], s["lon"]))
+        ranked = sorted(
+            stations, key=lambda s: haversine_m(lat, lon, s["lat"], s["lon"])
+        )
         selected = ranked[:limit_stations]
     needed_feeds = {_feed_for(r) for s in selected for r in s["routes"]}
     needed_feeds.discard(None)
@@ -262,7 +308,11 @@ def board(lat, lon, limit_stations=1, limit_arrivals=4, station_id=None, route=N
                     "lon": s["lon"],
                     "distance_m": round(haversine_m(lat, lon, s["lat"], s["lon"])),
                     "routes": s["routes"],
-                    **({"entrances": entrances[s["id"]]} if s["id"] in entrances else {}),
+                    **(
+                        {"entrances": entrances[s["id"]]}
+                        if s["id"] in entrances
+                        else {}
+                    ),
                 },
                 "arrivals": arrs,
                 "partial": any(fk not in loaded for fk in needed),
@@ -277,18 +327,36 @@ def board(lat, lon, limit_stations=1, limit_arrivals=4, station_id=None, route=N
         first["station"]["name"] = anchor["name"]
         first["station"]["lat"] = anchor["lat"]
         first["station"]["lon"] = anchor["lon"]
-        first["station"]["distance_m"] = round(haversine_m(lat, lon, anchor["lat"], anchor["lon"]))
+        first["station"]["distance_m"] = round(
+            haversine_m(lat, lon, anchor["lat"], anchor["lon"])
+        )
     for e in result_stations:
-        e['options'] = [dict(route=r, dest=d, dir=di) for r, d, di in sorted({
-            (a['route'], a['dest'], a['dir']) for a in e['arrivals']})]
-        e["arrivals"] = [a for a in e['arrivals'] if
-                         (not route or a['route'] == route) and
-                         (not dest or a['dest'] == dest) and
-                         (not direction or a['dir'] == direction)][:limit_arrivals]
+        e["options"] = [
+            dict(route=r, dest=d, dir=di)
+            for r, d, di in sorted(
+                {(a["route"], a["dest"], a["dir"]) for a in e["arrivals"]}
+            )
+        ]
+        e["arrivals"] = [
+            a
+            for a in e["arrivals"]
+            if (not route or a["route"] == route)
+            and (not dest or a["dest"] == dest)
+            and (not direction or a["dir"] == direction)
+        ][:limit_arrivals]
+    alerts, alerts_available = get_alerts()
+    for e in result_stations:
+        hits = for_station(alerts, e["station"]["routes"], e["station"]["id"])
+        if hits:
+            e["station"]["alerts"] = [
+                {"title": hit["title"], "desc": hit["desc"], "routes": hit["routes"]}
+                for hit in hits
+            ]
     return {
         "stations": result_stations,
         "cached": used_cache,
         "failed_feeds": failures,
+        "alerts_available": alerts_available,
     }
 
 
@@ -296,10 +364,21 @@ def merge_complexes(entries, limit_arrivals):
     """Merge same-name GTFS stations (e.g. Union Sq = R20 + 635 + L03)."""
     merged = []
     for e in entries:
-        m = next((item for item in merged
-                  if item["station"]["name"] == e["station"]["name"]
-                  and haversine_m(item["station"]["lat"], item["station"]["lon"],
-                                  e["station"]["lat"], e["station"]["lon"]) < 300), None)
+        m = next(
+            (
+                item
+                for item in merged
+                if item["station"]["name"] == e["station"]["name"]
+                and haversine_m(
+                    item["station"]["lat"],
+                    item["station"]["lon"],
+                    e["station"]["lat"],
+                    e["station"]["lon"],
+                )
+                < 300
+            ),
+            None,
+        )
         if m is not None:
             m["arrivals"] = sorted(
                 m["arrivals"] + e["arrivals"], key=lambda a: a["arrival_at"]
@@ -311,7 +390,9 @@ def merge_complexes(entries, limit_arrivals):
                 m["station"]["distance_m"], e["station"]["distance_m"]
             )
             if "entrances" in m["station"] or "entrances" in e["station"]:
-                m["station"]["entrances"] = combine(m["station"].get("entrances", []), e["station"].get("entrances", []))
+                m["station"]["entrances"] = combine(
+                    m["station"].get("entrances", []), e["station"].get("entrances", [])
+                )
             m["partial"] = m.get("partial", False) or e.get("partial", False)
         else:
             merged.append(e)
@@ -323,9 +404,13 @@ class Handler(BaseHTTPRequestHandler):
         pass  # Base handler includes raw URLs (GPS); use structured logs below.
 
     def log_request(self, code="-", size="-"):
-        LOG.info("request method=%s path=%s status=%s duration_ms=%.1f",
-                 self.command, urllib.parse.urlsplit(self.path).path, code,
-                 (time.monotonic() - getattr(self, "started", time.monotonic())) * 1000)
+        LOG.info(
+            "request method=%s path=%s status=%s duration_ms=%.1f",
+            self.command,
+            urllib.parse.urlsplit(self.path).path,
+            code,
+            (time.monotonic() - getattr(self, "started", time.monotonic())) * 1000,
+        )
 
     def send_json(self, obj, code=200):
         body = json.dumps(obj).encode()
@@ -351,9 +436,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("lat/lon out of range")
                 ls = min(max(ls, 1), 5)
                 la = min(max(la, 1), 8)
-                self.send_json(board(lat, lon, ls, la, q.get('station', [None])[0],
-                                     q.get('route', [None])[0], q.get('dest', [None])[0],
-                                     q.get('dir', [None])[0]))
+                self.send_json(
+                    board(
+                        lat,
+                        lon,
+                        ls,
+                        la,
+                        q.get("station", [None])[0],
+                        q.get("route", [None])[0],
+                        q.get("dest", [None])[0],
+                        q.get("dir", [None])[0],
+                    )
+                )
             except (ValueError, KeyError) as e:
                 self.send_json({"error": str(e)}, 400)
             except Exception as exc:
