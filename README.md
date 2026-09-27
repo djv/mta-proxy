@@ -29,6 +29,18 @@ Bundled `stations.json` avoids static-feed parsing at startup. If the optional
   fetch failure leaves the board working with `alerts_available: false`.
   Alerts come from the public `camsys/subway-alerts` GTFS-RT feed, cached 60s.
 
+- `GET /mta/reach?lat&lon&radius=700[&at=EPOCH]` → `home` (stations within
+  radius, walking seconds) and every station with a one-seat scheduled ride
+  home: `routes`, median `ride_min` to the door, `tph` within ±1 h of `at`.
+- `POST /mta/pack {key, lat, lon, stations[≤4]}` stores a run pack for 36 h
+  (key: 10–32 lowercase letters/digits, chosen by the client);
+  `GET /mta/pack?key=K[&hours=4]` → per station `d = [departure epoch, route
+  index, minutes to the door, ...]` (≤30), entrances, alert titles. Used by the
+  watch before a run so it can show scheduled trains home without the phone.
+- Schedules come from MTA's supplemented GTFS (planned work, next 7 days),
+  downloaded to `$MTA_PROXY_STATE` (default `~/mta-proxy/state`) every 6 h and
+  indexed for yesterday..+2 days (`timetable.py`, ~10 s, ~180 MB RSS).
+
 Limits: stations 1–5, arrivals 1–8. Feed cache 25s per line group.
 
 ## Notes

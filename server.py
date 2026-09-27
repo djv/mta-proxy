@@ -3,12 +3,16 @@
 
 GET /mta/health
 GET /mta/board?lat=..&lon=..&limitStations=1&limitArrivals=4
+GET /mta/reach?lat=..&lon=..&radius=700[&at=EPOCH]
+POST /mta/pack {key, lat, lon, stations}   GET /mta/pack?key=..
 """
 
 import csv
+import datetime
 import io
 import json
 import math
+import re
 import logging
 import os
 import threading
@@ -22,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from nyct_gtfs import NYCTFeed
 from entrances import load_entrances, combine
 from alerts import ALERTS_URL, for_station, parse_alerts
+from timetable import NYC, Holder
 
 
 LOG = logging.getLogger("mta-proxy")
@@ -36,6 +41,13 @@ STATIC_ZIP = "google_transit.zip"
 FEED_TTL_S = 25
 FEED_MAX_AGE_S = 180
 ALERTS_TTL_S = 60
+STATE_DIR = os.environ.get("MTA_PROXY_STATE", os.path.expanduser("~/mta-proxy/state"))
+PACK_TTL_S = 36 * 3600
+PACK_MAX = 200  # stored packs; oldest dropped first
+PACK_STATIONS = 4
+PACK_DEPS = 30
+PACK_KEY_RE = re.compile(r"^[a-z0-9]{10,32}$")
+WALK_MPS = 4.9 / 3.6 / 1.3  # 4.9 km/h over the straight line with a 1.3x street-grid detour
 
 stations = []  # [{id,name,lat,lon,routes[]}]
 entrances = {}
@@ -44,6 +56,8 @@ feeds_lock = threading.Lock()
 feeds_inflight = {}  # feed_key -> _Inflight
 alerts_cache = (0.0, [], False)  # (fetched_at, alerts, available)
 alerts_lock = threading.Lock()
+timetable = Holder(STATE_DIR)
+packs_lock = threading.Lock()
 
 
 class _Inflight:
@@ -399,6 +413,120 @@ def merge_complexes(entries, limit_arrivals):
     return merged
 
 
+def complex_ids(station_id):
+    """GTFS parent ids of the station complex containing station_id (same name within 300 m)."""
+    anchor = next((s for s in stations if s["id"] == station_id), None)
+    if anchor is None:
+        raise ValueError("Unknown station")
+    return [s["id"] for s in stations if s["name"] == anchor["name"]
+            and haversine_m(s["lat"], s["lon"], anchor["lat"], anchor["lon"]) < 300], anchor
+
+
+def home_stations(lat, lon, radius):
+    """Stations within radius of home -> walking seconds from them to the door."""
+    return {s["id"]: round(haversine_m(lat, lon, s["lat"], s["lon"]) / WALK_MPS)
+            for s in stations if haversine_m(lat, lon, s["lat"], s["lon"]) <= radius}
+
+
+def reach(lat, lon, radius=700, at=None):
+    tt = timetable.get()
+    if tt is None:
+        raise RuntimeError("timetable loading")
+    homes = home_stations(lat, lon, radius)
+    when = datetime.datetime.fromtimestamp(at or time.time(), NYC)
+    table = tt.reach(homes, when.date(), when.hour * 3600 + when.minute * 60)
+    by_id = {s["id"]: s for s in stations}
+    out = []
+    for sid, info in table.items():
+        s = by_id.get(sid)
+        if s is None:
+            continue
+        out.append({"id": sid, "name": s["name"], "lat": s["lat"], "lon": s["lon"],
+                    **({"entrances": entrances[sid]} if sid in entrances else {}), **info})
+    out.sort(key=lambda x: haversine_m(lat, lon, x["lat"], x["lon"]))
+    home = [{"id": sid, "name": by_id[sid]["name"], "walk_s": w} for sid, w in sorted(homes.items(), key=lambda x: x[1])]
+    return {"home": home, "stations": out}
+
+
+def _packs_path():
+    return os.path.join(STATE_DIR, "packs.json")
+
+
+def _load_packs():
+    try:
+        with open(_packs_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_pack(body, now=None):
+    """Store the stations of a planned run under a client-chosen key."""
+    now = int(now or time.time())
+    key = body.get("key")
+    if not isinstance(key, str) or not PACK_KEY_RE.match(key):
+        raise ValueError("key must be 10-32 lowercase letters/digits")
+    lat, lon = float(body["lat"]), float(body["lon"])
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError("lat/lon out of range")
+    ids = body.get("stations")
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("stations must be a non-empty list")
+    known = {s["id"] for s in stations}
+    ids = [i for i in dict.fromkeys(ids) if i in known][:PACK_STATIONS]
+    if not ids:
+        raise ValueError("Unknown station")
+    radius = min(max(int(body.get("radius", 700)), 100), 1500)
+    with packs_lock:
+        packs = {k: v for k, v in _load_packs().items() if now - v["created"] < PACK_TTL_S}
+        packs[key] = {"created": now, "lat": lat, "lon": lon, "radius": radius, "stations": ids}
+        for k in sorted(packs, key=lambda k: packs[k]["created"])[:-PACK_MAX]:
+            del packs[k]
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = _packs_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(packs, f)
+        os.replace(tmp, _packs_path())
+    return {"ok": True, "stations": ids, "expires": now + PACK_TTL_S}
+
+
+def get_pack(key, hours=4, now=None):
+    """Scheduled homebound departures for a stored pack, compact enough for a watch background task.
+
+    Each station's `d` is a flat list [departure epoch, route index, minutes to the door, ...];
+    `h` holds one index into `heads` (the train's terminal) per departure.
+    """
+    now = int(now or time.time())
+    with packs_lock:
+        pack = _load_packs().get(key) if isinstance(key, str) and PACK_KEY_RE.match(key) else None
+    if pack is None or now - pack["created"] >= PACK_TTL_S:
+        return None
+    tt = timetable.get()
+    if tt is None:
+        raise RuntimeError("timetable loading")
+    homes = home_stations(pack["lat"], pack["lon"], pack["radius"])
+    alerts, _ = get_alerts()
+    out = []
+    for sid in pack["stations"]:
+        ids, anchor = complex_ids(sid)
+        deps = tt.homebound(ids, homes, now - 60, hours, PACK_DEPS)
+        routes = sorted({d[0] for d in deps})
+        heads = sorted({d[4] for d in deps})
+        flat, h = [], []
+        for route, dep, door, _, head in deps:
+            flat += [dep, routes.index(route), round((door - dep) / 60)]
+            h.append(heads.index(head))
+        ent = []
+        for i in ids:
+            ent = combine(ent, entrances.get(i, []))
+        hits = for_station(alerts, sorted({r for s in stations if s["id"] in ids for r in s["routes"]}), sid)
+        out.append({"id": sid, "name": anchor["name"], "lat": anchor["lat"], "lon": anchor["lon"],
+                    "routes": routes, "entrances": ent[:6],
+                    "alerts": [{"title": a["title"][:100]} for a in hits[:2]], "d": flat,
+                    "heads": [x[:24] for x in heads], "h": h})
+    return {"v": 1, "generated": now, "expires": pack["created"] + PACK_TTL_S, "stations": out}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Base handler includes raw URLs (GPS); use structured logs below.
@@ -453,8 +581,49 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 LOG.error("board_failure type=%s", type(exc).__name__)
                 self.send_json({"error": "MTA feeds unavailable"}, 503)
+        elif u.path == "/mta/reach":
+            try:
+                lat, lon = float(q["lat"][0]), float(q["lon"][0])
+                radius = min(max(int(q.get("radius", ["700"])[0]), 100), 1500)
+                at = int(q["at"][0]) if "at" in q else None
+                self.send_json(reach(lat, lon, radius, at))
+            except (ValueError, KeyError) as e:
+                self.send_json({"error": str(e)}, 400)
+            except Exception as exc:
+                LOG.error("reach_failure type=%s", type(exc).__name__)
+                self.send_json({"error": "timetable unavailable"}, 503)
+        elif u.path == "/mta/pack":
+            try:
+                hours = min(max(float(q.get("hours", ["4"])[0]), 1), 6)
+                pack = get_pack(q.get("key", [""])[0], hours)
+                if pack is None:
+                    self.send_json({"error": "no pack"}, 404)
+                else:
+                    self.send_json(pack)
+            except ValueError as e:
+                self.send_json({"error": str(e)}, 400)
+            except Exception as exc:
+                LOG.error("pack_failure type=%s", type(exc).__name__)
+                self.send_json({"error": "timetable unavailable"}, 503)
         else:
             self.send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        self.started = time.monotonic()
+        u = urllib.parse.urlparse(self.path)
+        if u.path != "/mta/pack":
+            self.send_json({"error": "not found"}, 404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ValueError("body must be 1-4096 bytes")
+            self.send_json(save_pack(json.loads(self.rfile.read(length))))
+        except (ValueError, KeyError, TypeError) as e:
+            self.send_json({"error": str(e)}, 400)
+        except Exception as exc:
+            LOG.error("pack_save_failure type=%s", type(exc).__name__)
+            self.send_json({"error": "could not save"}, 500)
 
 
 def _mtime_str(path):
@@ -495,6 +664,7 @@ if __name__ == "__main__":
         _mtime_str(STATIC_ZIP),
     )
     entrances = load_entrances(stations)
+    timetable.start()
     print(f"{len(stations)} stations", flush=True)
     srv = ThreadingHTTPServer((bind_address(), PORT), Handler)
     print(f"listening on {bind_address()}:{PORT}", flush=True)
