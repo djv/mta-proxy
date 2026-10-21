@@ -9,3 +9,9 @@ libs/
 .env.*
 *.pem
 *.key
+!.env.deployment.example
+state/
+releases/
+snapshots/
+.pytest_cache/
+.ruff_cache/

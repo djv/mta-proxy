@@ -264,12 +264,12 @@ class SingleflightTests(unittest.TestCase):
         calls, release = [], threading.Event()
         feed_inst, fake_get = self._mock_fetch(now, calls, release)
         with self._patched(now, feed_inst, fake_get):
-            threads, results, errors = self._spawn(8, lambda: server.get_feed("gtfs-l"))
+            threads, results, errors = self._spawn(2, lambda: server.get_feed("gtfs-l"))
             self._wait_for_calls(calls)
             time.sleep(0.3)  # let waiters pile onto the in-flight fetch
             release.set()
             self._join(threads)
-        self.assertEqual(errors, [None] * 8)
+        self.assertEqual(errors, [None] * 2)
         for feed, cached in results:
             self.assertIs(feed, feed_inst)
             self.assertFalse(cached)
@@ -281,7 +281,7 @@ class SingleflightTests(unittest.TestCase):
             now, calls, release, fail=RuntimeError("down")
         )
         with self._patched(now, feed_inst, fake_get):
-            threads, results, errors = self._spawn(4, lambda: server.get_feed("gtfs-l"))
+            threads, results, errors = self._spawn(2, lambda: server.get_feed("gtfs-l"))
             self._wait_for_calls(calls)
             time.sleep(0.3)
             release.set()

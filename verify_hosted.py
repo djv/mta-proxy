@@ -2,12 +2,13 @@
 """Public API validation; optional --soak runs for ten minutes."""
 import concurrent.futures
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
 
-BASE = 'https://proxy.example.net'
+BASE = os.environ.get('MTA_PROXY_BASE', 'http://127.0.0.1:8087').rstrip('/')
 QUERY = '/mta/board?lat=40.7356&lon=-73.9910&limitStations=5&limitArrivals=8'
 
 

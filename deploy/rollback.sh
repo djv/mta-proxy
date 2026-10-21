@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Run on server. Optional --remove-route removes ONLY /mta on 443.
 set -euo pipefail
-root="$HOME/mta-proxy"
+source "$(dirname "$0")/config.sh"
 previous=$(readlink -f "$root/previous" || true)
 if [ -n "$previous" ] && [ -d "$previous" ]; then
   current=$(readlink -f "$root/current")
   ln -sfn "$previous" "$root/current"
   ln -sfn "$current" "$root/previous"
-  cp "$previous"/deploy/*.service "$previous"/deploy/*.timer "$HOME/.config/systemd/user/"
+  install_units "$previous"
   systemctl --user daemon-reload
   systemctl --user restart mta-proxy.service
 else
